@@ -1,0 +1,5 @@
+{"prompt": "请说明 RESTful API 设计中的 GET、POST、PUT、DELETE 的典型语义，并各举一个适用场景。"}
+{"prompt": "解释 Python 中 GIL 对多线程 CPU 密集任务的影响，以及常见的规避思路。"}
+{"prompt": "描述 Docker 镜像、容器与仓库之间的关系，并说明为什么容器比虚拟机更轻量。"}
+{"prompt": "什么是反向代理？Nginx 作为反向代理时通常承担哪些职责？"}
+{"prompt": "请对比 B 树与 B+ 树在数据库索引中的典型用法差异。"}
