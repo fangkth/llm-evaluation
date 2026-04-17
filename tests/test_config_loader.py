@@ -121,6 +121,37 @@ def test_concurrency_duplicate_rejected(tmp_path: Path) -> None:
         load_config(cfg_path)
 
 
+def test_sampling_gpu_indices_negative_rejected(tmp_path: Path) -> None:
+    (tmp_path / "s.jsonl").write_text(
+        '{"id":"1","category":"short","messages":[{"role":"user","content":"x"}]}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "m.jsonl").write_bytes((tmp_path / "s.jsonl").read_bytes())
+    (tmp_path / "l.jsonl").write_bytes((tmp_path / "s.jsonl").read_bytes())
+    cfg_path = _write_cfg(
+        tmp_path,
+        "gpu.yaml",
+        """
+        server:
+          base_url: "http://localhost:8000"
+          model: "m"
+        test:
+          concurrency: [1]
+        dataset:
+          short_ratio: 1.0
+          medium_ratio: 0.0
+          long_ratio: 0.0
+          short_file: "s.jsonl"
+          medium_file: "m.jsonl"
+          long_file: "l.jsonl"
+        sampling:
+          gpu_indices: [0, -1]
+        """,
+    )
+    with pytest.raises(ValidationError, match="非法负数"):
+        load_config(cfg_path)
+
+
 def test_examples_config_loads() -> None:
     """仓库内示例配置应能被完整解析（用于交付验收）。"""
     root = Path(__file__).resolve().parent.parent

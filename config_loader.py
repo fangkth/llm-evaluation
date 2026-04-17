@@ -154,10 +154,22 @@ class SamplingConfig(BaseModel):
         le=60,
         description="本机资源采样间隔（秒）",
     )
+    gpu_indices: list[int] = Field(
+        default_factory=list,
+        description="要监控的 GPU 索引；空列表表示自动探测并监控本机全部 GPU",
+    )
     random_seed: int = Field(
         default=42,
         description="样本配比随机抽样种子，固定后压测可复现",
     )
+
+    @field_validator("gpu_indices")
+    @classmethod
+    def gpu_indices_non_negative(cls, v: list[int]) -> list[int]:
+        for i in v:
+            if i < 0:
+                raise ValueError(f"sampling.gpu_indices 含有非法负数: {i}")
+        return v
 
 
 class ThresholdConfig(BaseModel):

@@ -27,6 +27,7 @@ dataset:
 sampling:
   resource_interval_sec: 1.0
   random_seed: 42
+  # gpu_indices: []  # 空列表 = 自动全部 GPU；非空则仅监控所列编号
 
 threshold:
   max_error_rate: 0.05

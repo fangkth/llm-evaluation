@@ -11,6 +11,7 @@ from typing import Any
 from jinja2 import Template
 
 from config_loader import EvalConfig
+from utils.deployment_context import build_environment_assumptions
 
 # 瓶颈类型 → 对外表述
 _BOTTLENECK_LABEL = {
@@ -162,8 +163,76 @@ def _build_table_rows(stages: list[dict[str, Any]]) -> list[dict[str, str]]:
     return rows
 
 
-def _closing_bullets(conclusions: dict[str, Any], cfg: EvalConfig) -> list[str]:
+def _build_gpu_markdown_block(resources_global: dict[str, Any], cfg: EvalConfig) -> str:
+    """报告中的 GPU 范围说明 + 全卡指标 + 单卡表。"""
+    g = (resources_global or {}).get("gpu") or {}
+    req = cfg.sampling.gpu_indices
+    lines: list[str] = []
+
+    if req:
+        lines.append(
+            f"- **配置 `sampling.gpu_indices`**：`{req}`（仅监控指定 GPU；非法编号会在压测启动前报错）。"
+        )
+    else:
+        lines.append(
+            "- **配置 `sampling.gpu_indices`**：未填写或为空 —— **自动探测并监控本机全部 GPU**。"
+        )
+
+    mi = g.get("monitored_indices") or []
+    if mi:
+        lines.append(
+            "- **本 run 采样数据中的 GPU 编号**："
+            + "、".join(str(x) for x in mi)
+            + "。"
+        )
+    else:
+        lines.append(
+            "- **本 run 采样数据中的 GPU**：（无；可能无 NVIDIA 设备、监控未启用或采集失败。）"
+        )
+
+    gu = g.get("utilization_percent") or {}
+    gmu = g.get("memory_utilization_percent") or {}
+    lines.append(
+        f"- **全卡综合**（跨时间 × 跨卡，逐条采样算术平均；峰值取所有「单卡·单时刻」采样中的最大值）："
+        f" GPU 利用率 平均 **{gu.get('avg', 0):.1f}%**、峰值 **{gu.get('peak', 0):.1f}%**；"
+        f"显存利用率 平均 **{gmu.get('avg', 0):.1f}%**、峰值 **{gmu.get('peak', 0):.1f}%**。"
+    )
+
+    byd = g.get("by_device") or {}
+    if byd:
+        lines.extend(
+            [
+                "",
+                "#### 单卡视角摘要",
+                "",
+                "| GPU | 平均利用率 | 峰值利用率 | 平均显存利用率 | 峰值显存利用率 |",
+                "|-----|-----------:|-----------:|---------------:|---------------:|",
+            ]
+        )
+        for k in sorted(byd.keys(), key=lambda x: int(x)):
+            d = byd[k]
+            u = d.get("utilization_percent") or {}
+            m = d.get("memory_utilization_percent") or {}
+            lines.append(
+                f"| {k} | {u.get('avg', 0):.1f}% | {u.get('peak', 0):.1f}% | "
+                f"{m.get('avg', 0):.1f}% | {m.get('peak', 0):.1f}% |"
+            )
+
+    return "\n".join(lines)
+
+
+def _closing_bullets(
+    conclusions: dict[str, Any],
+    cfg: EvalConfig,
+    *,
+    remote_service: bool = False,
+) -> list[str]:
     out: list[str] = []
+    if remote_service:
+        out.append(
+            "若压测指向 **远端服务**，资源与容量相关建议请结合 **服务端监控** 交叉验证；"
+            "瓶颈类型描述更多反映 **本机采样视角**，不宜单独作为排障依据。"
+        )
     ms = int(conclusions.get("max_stable_concurrency", 0))
     sr = conclusions.get("safe_concurrency_range", {})
     lo, hi = int(sr.get("min", 1)), int(sr.get("max", 1))
@@ -184,9 +253,44 @@ def _closing_bullets(conclusions: dict[str, Any], cfg: EvalConfig) -> list[str]:
     return out
 
 
-REPORT_TEMPLATE = """# LLM 服务容量测评报告
+def _build_remote_banner(env: dict[str, Any]) -> str:
+    if not env.get("remote_service_warning"):
+        return ""
+    return (
+        "\n> **【远端服务警告】** 资源数据来自 **运行本工具的本机**，与推理服务所在机器 **可能不一致**。"
+        " **吞吐与时延** 结论可参考；**资源瓶颈相关结论仅供参考**，请结合服务端监控。\n"
+    )
 
+
+def _build_scope_section_markdown(env: dict[str, Any]) -> str:
+    lines = [
+        "## 适用范围与说明",
+        "",
+        "- 本次 **CPU / 内存 / GPU** 等指标均为 **工具运行所在主机** 的本地采样。",
+        "- **建议** 在与被测 vLLM（或兼容 OpenAI 接口的推理服务）**同一台单机** 上运行本工具，以便资源与推理负载对齐。",
+        "- 当前版本 **主要适用于单机部署**；**暂不支持** 多机多卡资源统一采集与汇总分析。",
+    ]
+    if env.get("remote_service_warning"):
+        msg = (env.get("warning_message") or "").strip()
+        lines.extend(
+            [
+                "",
+                "> **警告**：`base_url` 指向 **远端**。本机采集的资源 **无法** 代表远端实例占用；"
+                " **资源瓶颈分析需谨慎解读**。",
+            ]
+        )
+        if msg:
+            lines.append(f"> {msg}")
+    return "\n".join(lines)
+
+
+REPORT_TEMPLATE = """# LLM 服务容量测评报告
+{{ remote_banner }}
 > 本文档由测评工具根据实测数据自动生成，供内部汇报与客户沟通使用。
+
+---
+
+{{ scope_section }}
 
 ---
 
@@ -201,6 +305,10 @@ REPORT_TEMPLATE = """# LLM 服务容量测评报告
 | 并发档位 | {{ overview.concurrency_list }} |
 | 单档正式时长 | {{ overview.duration_sec }} s（预热 {{ overview.ramp_up_sec }} s） |
 
+### GPU 资源监控
+
+{{ gpu_block }}
+
 ## 2. 测试样本说明
 
 {{ sample_section }}
@@ -209,7 +317,7 @@ REPORT_TEMPLATE = """# LLM 服务容量测评报告
 
 - **最大稳定并发（估算）**：**{{ key.max_stable }}** 路  
 - **建议安全运行区间**：**{{ key.safe_low }} ～ {{ key.safe_high }}** 路  
-- **当前主要瓶颈（程序判定）**：{{ key.bottleneck_human }}  
+- **当前主要瓶颈（程序判定）**：{{ key.bottleneck_human }}{{ key.bottleneck_qualifier }}  
 - **要点说明**：{{ key.bottleneck_detail }}
 
 ---
@@ -222,7 +330,7 @@ REPORT_TEMPLATE = """# LLM 服务容量测评报告
 | {{ row.conc }} | {{ row.sr }} | {{ row.ttft_mean }} | {{ row.ttft_p95 }} | {{ row.lat_mean }} | {{ row.lat_p95 }} | {{ row.tok_s }} | {{ row.gpu_u_avg }} | {{ row.gpu_mem_avg }} |
 {% endfor %}
 
-*说明：GPU 指标来自该档对应时间窗内的采样均值；若本机无 GPU 或监控未采集到数据，表中可能为 0%。*
+*说明：表中 GPU 列为该档时间窗内**所有已监控 GPU、所有采样点**的综合平均；无数据时为 0%。{{ table_gpu_caveat }}*
 
 ---
 
@@ -283,15 +391,35 @@ def write_benchmark_report(
         f"实际抽样为加权随机，明细见原始请求表。"
     )
 
+    env = data.get("environment_assumptions")
+    if not isinstance(env, dict) or not env:
+        env = build_environment_assumptions(cfg.server.base_url)
+    remote = bool(env.get("remote_service_warning"))
+
     bcode = str(conclusions.get("bottleneck", "unknown"))
     ms = int(conclusions.get("max_stable_concurrency", 0))
     srng = conclusions.get("safe_concurrency_range") or {}
+    raw_detail = str(conclusions.get("bottleneck_detail", "—")).strip() or "—"
+    if remote:
+        bq = "（*从本机采样推断；远端服务时资源类判断仅供参考*）"
+        if raw_detail != "—":
+            bdetail = (
+                f"从本机采样数据看：{raw_detail} "
+                "由于被测服务可能不在本机，**资源瓶颈判断仅供参考**。"
+            )
+        else:
+            bdetail = "由于被测服务可能不在本机，**资源瓶颈判断仅供参考**。"
+    else:
+        bq = ""
+        bdetail = raw_detail
+
     key = {
         "max_stable": str(ms) if ms > 0 else "本次未识别（请检查阈值或复测）",
         "safe_low": srng.get("min", "—") if ms > 0 else "—",
         "safe_high": srng.get("max", "—") if ms > 0 else "—",
         "bottleneck_human": bottleneck_label(bcode),
-        "bottleneck_detail": str(conclusions.get("bottleneck_detail", "—")).strip() or "—",
+        "bottleneck_qualifier": bq,
+        "bottleneck_detail": bdetail,
     }
 
     raw_path = run_dir / "raw_requests.csv"
@@ -307,18 +435,37 @@ def write_benchmark_report(
         "### 5.3 长请求与尾延迟",
         _narrative_long_requests(raw_rows, stages),
     ]
-    analysis_block = "\n".join(analysis_parts)
+    analysis_prefix = ""
+    if remote:
+        analysis_prefix = (
+            "> **说明**：以下基于请求日志的延迟与成功率分析仍可参考；"
+            " 涉及资源占用与「环境上限」的推断在 **远端服务** 场景下 **仅供参考**。\n\n"
+        )
+    analysis_block = analysis_prefix + "\n".join(analysis_parts)
 
-    closing_lines = _closing_bullets(conclusions, cfg)
+    closing_lines = _closing_bullets(conclusions, cfg, remote_service=remote)
+
+    rg = data.get("resources_global") or {}
+    gpu_block = _build_gpu_markdown_block(rg, cfg)
+
+    table_gpu_caveat = (
+        " **远端服务时，表中 GPU 为本机数据，不代表远端推理机。**"
+        if remote
+        else ""
+    )
 
     tmpl = Template(REPORT_TEMPLATE)
     md = tmpl.render(
+        remote_banner=_build_remote_banner(env),
+        scope_section=_build_scope_section_markdown(env),
         overview=overview,
+        gpu_block=gpu_block,
         sample_section=sample_section,
         key=key,
         table_rows=_build_table_rows(stages),
         analysis_block=analysis_block,
         closing_lines=closing_lines,
+        table_gpu_caveat=table_gpu_caveat,
         run_dir=str(run_dir.resolve()),
     )
 

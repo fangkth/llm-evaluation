@@ -26,6 +26,7 @@ dataset:
 
 sampling:
   resource_interval_sec: 1.0
+  # gpu_indices: [0, 1, 2, 3] # 省略或 [] = 自动监控本机全部 GPU
   random_seed: 42
 
 threshold:

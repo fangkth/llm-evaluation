@@ -180,7 +180,7 @@ class BenchmarkRunner:
         self._run_dir = Path(run_dir)
         self._resource_interval = float(resource_interval_sec)
         self._enable_gpu = enable_gpu_monitor
-        self._gpu_indices = list(gpu_indices) if gpu_indices is not None else [0]
+        self._gpu_indices = [] if gpu_indices is None else list(gpu_indices)
         self._temperature = float(temperature)
 
     async def run(self) -> tuple[list[LevelResult], list[MetricSample]]:
@@ -191,7 +191,11 @@ class BenchmarkRunner:
             enable_gpu=self._enable_gpu,
             gpu_indices=self._gpu_indices,
         )
-        monitor.start()
+        try:
+            monitor.start()
+        except ValueError as e:
+            console.print(f"[red]GPU 监控配置错误：{e}[/red]")
+            raise
         console.print("[bold]资源监控已启动[/bold]（压测全程）")
         all_levels: list[LevelResult] = []
         metric_samples: list[MetricSample] = []

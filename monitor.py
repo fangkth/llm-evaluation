@@ -1,6 +1,6 @@
 """本机资源监控：周期性采集 CPU / 内存 / 网络 / GPU，结构化存储并支持导出 CSV。
 
-GPU 优先 NVML（pynvml），不可用时降级 ``nvidia-smi``。单指标失败不影响整次采样。
+GPU 优先 NVML（pynvml），不可用时降级 ``nvidia-smi``。``gpu_indices`` 为空表示自动监控本机全部 GPU。
 """
 
 from __future__ import annotations
@@ -15,6 +15,63 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+
+def _count_gpus_nvidia_smi() -> int:
+    exe = shutil.which("nvidia-smi")
+    if not exe:
+        return 0
+    proc = subprocess.run(
+        [exe, "--query-gpu=index", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        timeout=8,
+    )
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        return 0
+    return sum(1 for line in proc.stdout.strip().splitlines() if line.strip())
+
+
+def _count_gpus_pynvml(pynvml: Any) -> int:
+    try:
+        return int(pynvml.nvmlDeviceGetCount())
+    except Exception:
+        return 0
+
+
+def probe_gpu_device_count(pynvml_module: Any | None, nvml_inited: bool) -> int:
+    """返回本机 GPU 数量；优先 NVML，否则 nvidia-smi 行数。"""
+    if nvml_inited and pynvml_module is not None:
+        n = _count_gpus_pynvml(pynvml_module)
+        if n > 0:
+            return n
+    return _count_gpus_nvidia_smi()
+
+
+def resolve_gpu_indices_for_monitoring(
+    enable_gpu: bool,
+    requested: list[int],
+    device_count: int,
+) -> list[int]:
+    """解析最终要采样的 GPU 编号列表。
+
+    - ``requested`` 为空：``0 .. device_count-1``（无卡则 ``[]``）。
+    - ``requested`` 非空：校验范围后去重排序；无卡或越界则 ``ValueError``（中文说明）。
+    """
+    if not enable_gpu:
+        return []
+    if not requested:
+        return list(range(device_count)) if device_count > 0 else []
+    if device_count <= 0:
+        raise ValueError(
+            "配置中指定了 sampling.gpu_indices，但本机未检测到 NVIDIA GPU（NVML / nvidia-smi 不可用或卡数为 0）。"
+        )
+    bad = [i for i in requested if i < 0 or i >= device_count]
+    if bad:
+        raise ValueError(
+            f"sampling.gpu_indices 中含有无效 GPU 编号 {bad}：本机共检测到 {device_count} 张 GPU，合法索引为 0～{device_count - 1}。"
+        )
+    return sorted(set(requested))
 
 
 @dataclass
@@ -50,7 +107,6 @@ class MetricSample:
     """单次采样（一个时间点的主机 + 多 GPU 列表）。"""
 
     timestamp: float = field(default_factory=time.time)
-    # 主机
     cpu_percent: float = 0.0
     memory_percent: float = 0.0
     memory_used_mb: float = 0.0
@@ -61,7 +117,6 @@ class MetricSample:
 
     @property
     def mem_used_gb(self) -> float:
-        """主机内存已用（GB），兼容 analyzer。"""
         return self.memory_used_mb / 1024.0
 
     @property
@@ -70,7 +125,6 @@ class MetricSample:
 
     @property
     def gpu_metrics(self) -> list[dict[str, Any]]:
-        """兼容 analyzer._fill_resource_peaks。"""
         return [g.to_legacy_dict() for g in self.gpus]
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,11 +137,13 @@ class MetricSample:
 
 
 class _MetricCollector:
-    """有状态采集器（NVML 生命周期、网络累计基准）。"""
+    """有状态采集器（NVML 生命周期、网络累计基准、解析后的 GPU 列表）。"""
 
-    def __init__(self, enable_gpu: bool, gpu_indices: list[int]) -> None:
+    def __init__(self, enable_gpu: bool, gpu_indices_requested: list[int]) -> None:
         self._enable_gpu = enable_gpu
-        self._gpu_indices = list(gpu_indices)
+        self._requested = list(gpu_indices_requested)
+        self._gpu_indices: list[int] = []
+        self._gpu_index_set: frozenset[int] = frozenset()
         self._pynvml: Any = None
         self._nvml_inited = False
         self._net_sent0 = 0
@@ -103,8 +159,16 @@ class _MetricCollector:
         except Exception:
             self._net_sent0 = 0
             self._net_recv0 = 0
+
         if self._enable_gpu:
             self._try_nvml_init()
+            cnt = probe_gpu_device_count(self._pynvml, self._nvml_inited)
+            self._gpu_indices = resolve_gpu_indices_for_monitoring(
+                True, self._requested, cnt
+            )
+        else:
+            self._gpu_indices = []
+        self._gpu_index_set = frozenset(self._gpu_indices)
 
     def teardown(self) -> None:
         if self._nvml_inited and self._pynvml is not None:
@@ -153,7 +217,7 @@ class _MetricCollector:
             sample.network_bytes_sent = 0
             sample.network_bytes_recv = 0
 
-        if self._enable_gpu:
+        if self._enable_gpu and self._gpu_indices:
             sample.gpus = self._collect_gpus_safe()
 
         return sample
@@ -219,7 +283,7 @@ class _MetricCollector:
             cmd,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=8,
         )
         if proc.returncode != 0 or not proc.stdout.strip():
             return []
@@ -236,7 +300,7 @@ class _MetricCollector:
                 idx = int(float(parts[0]))
             except ValueError:
                 continue
-            if self._gpu_indices and idx not in self._gpu_indices:
+            if idx not in self._gpu_index_set:
                 continue
             try:
                 util = float(parts[1]) if parts[1] else 0.0
@@ -275,7 +339,7 @@ def _parse_float_maybe(s: str) -> float | None:
 
 
 def export_samples_csv(samples: list[MetricSample], path: Path) -> Path:
-    """将样本展开为「每行 = 一条 GPU 记录」的 CSV（同一时间戳多 GPU 多行）；无 GPU 时仍输出一行 gpu_index=-1。"""
+    """每行一条 GPU 记录；无 GPU 时 ``gpu_index=-1``。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
@@ -328,7 +392,7 @@ def export_samples_csv(samples: list[MetricSample], path: Path) -> Path:
 
 
 class ResourceMonitor:
-    """后台线程周期采样；适合与 asyncio 压测并存。"""
+    """后台线程周期采样；``gpu_indices`` 为空表示自动监控全部 GPU。"""
 
     def __init__(
         self,
@@ -338,15 +402,19 @@ class ResourceMonitor:
     ) -> None:
         self._interval = max(0.05, float(interval))
         self._enable_gpu = enable_gpu
-        self._gpu_indices = list(gpu_indices) if gpu_indices is not None else [0]
+        req = [] if gpu_indices is None else list(gpu_indices)
         self._samples: list[MetricSample] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
-        self._collector = _MetricCollector(self._enable_gpu, self._gpu_indices)
+        self._collector = _MetricCollector(self._enable_gpu, req)
 
     def start(self) -> None:
-        self._collector.setup()
+        try:
+            self._collector.setup()
+        except Exception:
+            self._collector.teardown()
+            raise
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="resource-monitor")
         self._thread.start()
@@ -371,7 +439,7 @@ class ResourceMonitor:
 
 
 class AsyncResourceMonitor:
-    """asyncio 周期采样，API 与线程版对称。"""
+    """asyncio 周期采样。"""
 
     def __init__(
         self,
@@ -381,14 +449,18 @@ class AsyncResourceMonitor:
     ) -> None:
         self._interval = max(0.05, float(interval))
         self._enable_gpu = enable_gpu
-        self._gpu_indices = list(gpu_indices) if gpu_indices is not None else [0]
+        req = [] if gpu_indices is None else list(gpu_indices)
         self._samples: list[MetricSample] = []
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
-        self._collector = _MetricCollector(self._enable_gpu, self._gpu_indices)
+        self._collector = _MetricCollector(self._enable_gpu, req)
 
     async def start(self) -> None:
-        self._collector.setup()
+        try:
+            self._collector.setup()
+        except Exception:
+            self._collector.teardown()
+            raise
         self._stop.clear()
         self._task = asyncio.create_task(self._loop(), name="async-resource-monitor")
 

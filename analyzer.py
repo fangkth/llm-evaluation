@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +16,7 @@ from typing import Any
 import numpy as np
 
 from config_loader import EvalConfig, ThresholdConfig
+from utils.deployment_context import build_environment_assumptions
 
 
 # ---------------------------------------------------------------------------
@@ -218,18 +220,40 @@ def aggregate_resources_global(rows: list[ResourceRow]) -> dict[str, Any]:
             host_mem_by_ts[r.timestamp] = r.memory_used_mb
     hm = np.array(list(host_mem_by_ts.values())) if host_mem_by_ts else np.array([])
 
+    # 每条 CSV 行对应「某时刻 × 某 GPU」；全卡指标为跨时间、跨卡的综合均值 / 全局峰值。
     gpu_u: list[float] = []
     gpu_m: list[float] = []
     gpu_used_mb: list[float] = []
+    by_dev: dict[int, dict[str, list[float]]] = defaultdict(
+        lambda: {"util": [], "mem_util": []}
+    )
     for r in rows:
         if r.gpu_index >= 0:
             gpu_u.append(r.gpu_utilization)
             gpu_m.append(r.gpu_memory_utilization)
+            by_dev[r.gpu_index]["util"].append(r.gpu_utilization)
+            by_dev[r.gpu_index]["mem_util"].append(r.gpu_memory_utilization)
             if r.gpu_memory_used_mb > 0:
                 gpu_used_mb.append(r.gpu_memory_used_mb)
     gu = np.array(gpu_u)
     gm = np.array(gpu_m)
     gum = np.array(gpu_used_mb)
+
+    by_device_out: dict[str, Any] = {}
+    for idx in sorted(by_dev.keys()):
+        u_arr = np.array(by_dev[idx]["util"])
+        m_arr = np.array(by_dev[idx]["mem_util"])
+        by_device_out[str(idx)] = {
+            "utilization_percent": {
+                "avg": float(np.mean(u_arr)) if u_arr.size else 0.0,
+                "peak": float(np.max(u_arr)) if u_arr.size else 0.0,
+            },
+            "memory_utilization_percent": {
+                "avg": float(np.mean(m_arr)) if m_arr.size else 0.0,
+                "peak": float(np.max(m_arr)) if m_arr.size else 0.0,
+            },
+        }
+
     return {
         "cpu_percent": {
             "avg": float(np.mean(cpus)) if cpus.size else 0.0,
@@ -244,6 +268,7 @@ def aggregate_resources_global(rows: list[ResourceRow]) -> dict[str, Any]:
             "peak": float(np.max(hm)) if hm.size else 0.0,
         },
         "gpu": {
+            "monitored_indices": sorted(by_dev.keys()),
             "utilization_percent": {
                 "avg": float(np.mean(gu)) if gu.size else 0.0,
                 "peak": float(np.max(gu)) if gu.size else 0.0,
@@ -254,6 +279,7 @@ def aggregate_resources_global(rows: list[ResourceRow]) -> dict[str, Any]:
             },
             "memory_used_mb_peak": float(np.max(gum)) if gum.size else 0.0,
             "sample_count": int(gu.size),
+            "by_device": by_device_out,
         },
     }
 
@@ -497,6 +523,7 @@ def analyze_run(run_dir: Path, cfg: EvalConfig) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "run_dir": str(run_dir.resolve()),
+        "environment_assumptions": build_environment_assumptions(cfg.server.base_url),
         "config": {
             "server": {
                 "base_url": cfg.server.base_url,
@@ -507,6 +534,10 @@ def analyze_run(run_dir: Path, cfg: EvalConfig) -> dict[str, Any]:
                 "concurrency": cfg.test.concurrency,
                 "duration_sec": cfg.test.duration_sec,
                 "ramp_up_sec": cfg.test.ramp_up_sec,
+            },
+            "sampling": {
+                "resource_interval_sec": cfg.sampling.resource_interval_sec,
+                "gpu_indices": list(cfg.sampling.gpu_indices),
             },
             "threshold": cfg.threshold.model_dump(),
         },

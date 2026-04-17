@@ -10,6 +10,7 @@ import pytest
 from config_loader import DatasetConfig, EvalConfig, ServerConfig, ThresholdConfig
 from config_loader import TestConfig as BenchTestConfig
 from analyzer import (
+    ResourceRow,
     aggregate_resources_global,
     analyze_run,
     build_conclusions,
@@ -134,6 +135,10 @@ def test_analyze_run_writes_summary(tmp_path: Path) -> None:
     assert (tmp_path / "summary.json").exists()
     assert summary["stages"][0]["concurrency"] == 1
     assert summary["stages"][0]["requests"]["success_rate"] == 1.0
+    ea = summary["environment_assumptions"]
+    assert ea["resource_sampling_scope"] == "local_machine"
+    assert ea["deployment_scope"] == "single_node_only"
+    assert ea["remote_service_warning"] is False
 
 
 def test_load_raw_missing_file(tmp_path: Path) -> None:
@@ -187,6 +192,20 @@ def test_find_max_stable_none() -> None:
     th = ThresholdConfig(min_success_rate=0.99)
     stages = [_fake_stage(1, success_rate=0.5, p95_ttft=1.0, p95_lat=1.0)]
     assert find_max_stable_concurrency(stages, th) == 0
+
+
+def test_aggregate_resources_multi_gpu_by_device() -> None:
+    rows = [
+        ResourceRow(1.0, 0.0, 0.0, 0.0, 0.0, 0, 50.0, 60.0, 100.0),
+        ResourceRow(1.0, 0.0, 0.0, 0.0, 0.0, 1, 30.0, 40.0, 200.0),
+        ResourceRow(2.0, 0.0, 0.0, 0.0, 0.0, 0, 70.0, 60.0, 100.0),
+    ]
+    g = aggregate_resources_global(rows)["gpu"]
+    assert g["monitored_indices"] == [0, 1]
+    assert g["utilization_percent"]["avg"] == pytest.approx((50 + 30 + 70) / 3)
+    assert g["utilization_percent"]["peak"] == 70.0
+    assert g["by_device"]["0"]["utilization_percent"]["peak"] == 70.0
+    assert g["by_device"]["1"]["utilization_percent"]["avg"] == 30.0
 
 
 def test_build_conclusions_shape() -> None:

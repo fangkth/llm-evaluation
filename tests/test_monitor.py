@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from monitor import GpuMetric, MetricSample, export_samples_csv
+import pytest
+
+from monitor import GpuMetric, MetricSample, export_samples_csv, resolve_gpu_indices_for_monitoring
 
 
 def test_metric_sample_legacy_gpu_metrics() -> None:
@@ -65,3 +67,21 @@ def test_export_csv_long_format(tmp_path: Path) -> None:
     assert text.count("1.0") >= 1
     lines = text.strip().splitlines()
     assert len(lines) == 1 + 3
+
+
+def test_resolve_gpu_auto_all() -> None:
+    assert resolve_gpu_indices_for_monitoring(True, [], 8) == [0, 1, 2, 3, 4, 5, 6, 7]
+
+
+def test_resolve_gpu_explicit_dedup() -> None:
+    assert resolve_gpu_indices_for_monitoring(True, [2, 0, 2], 4) == [0, 2]
+
+
+def test_resolve_gpu_invalid_index_raises() -> None:
+    with pytest.raises(ValueError, match="无效"):
+        resolve_gpu_indices_for_monitoring(True, [0, 9], 2)
+
+
+def test_resolve_gpu_explicit_but_no_hardware() -> None:
+    with pytest.raises(ValueError, match="未检测到"):
+        resolve_gpu_indices_for_monitoring(True, [0], 0)

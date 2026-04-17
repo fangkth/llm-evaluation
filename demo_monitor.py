@@ -16,7 +16,7 @@ from monitor import ResourceMonitor, export_samples_csv
 
 def main() -> None:
     out = Path("output/demo_metrics.csv")
-    mon = ResourceMonitor(interval=1.0, enable_gpu=True, gpu_indices=[0])
+    mon = ResourceMonitor(interval=1.0, enable_gpu=True, gpu_indices=None)
     print("开始采样（10 秒），间隔 1s…")
     mon.start()
     time.sleep(10)

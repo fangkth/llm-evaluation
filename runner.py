@@ -16,10 +16,40 @@ from benchmark import BenchmarkRunner
 from config_loader import EvalConfig, format_validation_error, load_config
 from report import bottleneck_label, write_benchmark_report
 from sampler import DatasetSampler
+from utils.deployment_context import build_environment_assumptions
 from utils.logging_utils import setup_logging
 from utils.time_utils import format_duration, run_tag_from_now
 
 console = Console()
+
+
+def _print_deployment_scope_notice() -> None:
+    console.print(
+        Panel(
+            "• 资源采样仅在 **[bold]本工具运行的机器[/bold]** 上进行。\n"
+            "• 建议将本工具与 **[bold]被测 vLLM / 推理服务[/bold]** 部署在 **[bold]同一台单机[/bold]** 上执行。\n"
+            "• 当前版本面向 **[bold]单机部署[/bold]**；**不支持** 多机资源统一采集与汇总分析。",
+            title="部署与采样范围",
+            border_style="blue",
+        )
+    )
+
+
+def _print_remote_service_warning(cfg: EvalConfig) -> None:
+    env = build_environment_assumptions(cfg.server.base_url)
+    if not env.get("remote_service_warning"):
+        return
+    console.print(
+        Panel(
+            "[yellow][bold]警告：正在请求远端服务[/bold][/yellow]\n\n"
+            "• 压测请求发往 `base_url`，资源指标仍来自 **本机**。\n"
+            "• 本机 GPU/CPU 等 **不一定** 对应远端推理进程负载。\n"
+            "• **时延、成功率** 等结论可参考；**资源瓶颈判断可能不准确**。\n\n"
+            f"[dim]{env.get('warning_message', '')}[/dim]",
+            title="远端服务",
+            border_style="yellow",
+        )
+    )
 
 
 def _make_sampler(cfg: EvalConfig) -> DatasetSampler:
@@ -29,10 +59,16 @@ def _make_sampler(cfg: EvalConfig) -> DatasetSampler:
 
 def _print_config_brief(cfg: EvalConfig, run_dir: Path | None) -> None:
     levels = cfg.test.effective_concurrency_levels()
+    gpu_disp = (
+        ", ".join(str(i) for i in cfg.sampling.gpu_indices)
+        if cfg.sampling.gpu_indices
+        else "自动（本机全部）"
+    )
     lines = [
         f"服务: {cfg.server.base_url}  |  模型: {cfg.server.model}",
         f"模式: {cfg.test.mode.value}  |  档位: {levels}  |  单档: {cfg.test.duration_sec}s"
         + (f"（预热 {cfg.test.ramp_up_sec}s）" if cfg.test.ramp_up_sec else ""),
+        f"监控 GPU: {gpu_disp}",
         f"样本配比 short/medium/long: {cfg.dataset.short_ratio:.0%} / "
         f"{cfg.dataset.medium_ratio:.0%} / {cfg.dataset.long_ratio:.0%}",
         f"预计总时长约 {format_duration(len(levels) * (cfg.test.duration_sec + cfg.test.ramp_up_sec))}",
@@ -64,8 +100,13 @@ def _print_conclusion_footer(
     else:
         safe_txt = "—（需先识别最大稳定并发）"
 
+    env = summary.get("environment_assumptions") or {}
+    cave = ""
+    if env.get("remote_service_warning"):
+        cave = "\n[yellow]（远端服务：资源瓶颈类结论仅供参考）[/yellow]"
+
     body = (
-        f"主要瓶颈: [yellow]{bottleneck_label(bcode)}[/yellow]\n"
+        f"主要瓶颈: [yellow]{bottleneck_label(bcode)}[/yellow]{cave}\n"
         f"最大稳定并发: [cyan]{_format_max_stable(ms)}[/cyan]\n"
         f"建议安全区间: [cyan]{safe_txt}[/cyan]\n"
         f"{near_line}\n\n"
@@ -90,7 +131,7 @@ async def _run_pipeline(cfg: EvalConfig, run_dir: Path, sampler: DatasetSampler)
         run_dir=run_dir,
         resource_interval_sec=cfg.sampling.resource_interval_sec,
         enable_gpu_monitor=True,
-        gpu_indices=[0],
+        gpu_indices=cfg.sampling.gpu_indices,
     )
 
     console.print("[bold][3/7] 执行压测[/bold]（向被测服务发请求）…")
@@ -146,6 +187,8 @@ def run_command(
         raise typer.Exit(code=1) from e
 
     console.print("[green][1/7] 配置已加载并校验通过[/green]")
+    _print_deployment_scope_notice()
+    _print_remote_service_warning(cfg)
 
     try:
         sampler = _make_sampler(cfg)
