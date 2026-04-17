@@ -154,14 +154,35 @@ class SamplingConfig(BaseModel):
         le=60,
         description="本机资源采样间隔（秒）",
     )
+    random_seed: int = Field(
+        default=42,
+        description="样本配比随机抽样种子，固定后压测可复现",
+    )
 
 
 class ThresholdConfig(BaseModel):
     """稳定性与 SLA 阈值（用于分析阶段）。"""
 
-    max_error_rate: float = Field(default=0.05, ge=0.0, lt=1.0, description="最大可接受错误率")
+    max_error_rate: float = Field(default=0.05, ge=0.0, lt=1.0, description="最大可接受错误率（兼容旧逻辑）")
+    min_success_rate: float = Field(
+        default=0.99,
+        ge=0.0,
+        le=1.0,
+        description="判定「最大稳定并发」时要求达到的最低成功率",
+    )
     max_p95_ttft_sec: float = Field(default=30.0, gt=0, description="P95 首 token 延迟上限（秒）")
     max_p95_latency_sec: float = Field(default=120.0, gt=0, description="P95 端到端延迟上限（秒）")
+    latency_regression_ratio: float = Field(
+        default=1.2,
+        gt=1.0,
+        description="相对前一档位 P95 延迟/TTFT 上升超过该倍数视为明显跳升",
+    )
+    gpu_high_util_avg: float = Field(default=75.0, ge=0.0, le=100.0, description="GPU 平均利用率「偏高」阈值（%）")
+    gpu_high_util_peak: float = Field(default=88.0, ge=0.0, le=100.0, description="GPU 峰值利用率「饱和」参考（%）")
+    gpu_high_mem_util_avg: float = Field(default=80.0, ge=0.0, le=100.0, description="显存利用率均值「偏高」阈值（%）")
+    gpu_high_mem_util_peak: float = Field(default=92.0, ge=0.0, le=100.0, description="显存利用率峰值「紧张」阈值（%）")
+    safe_concurrency_low_ratio: float = Field(default=0.7, gt=0.0, lt=1.0, description="建议安全区间下限 = 最大稳定并发 × 该比例")
+    safe_concurrency_high_ratio: float = Field(default=0.8, gt=0.0, le=1.0, description="建议安全区间上限 = 最大稳定并发 × 该比例")
 
 
 class OutputConfig(BaseModel):
@@ -198,6 +219,12 @@ class EvalConfig(BaseModel):
                 f"根据当前 test 参数估算总时长约 {total}s，超过 2 小时上限，"
                 "请减少并发档位数、duration_sec 或 ramp_up_sec。"
             )
+        lo = self.threshold.safe_concurrency_low_ratio
+        hi = self.threshold.safe_concurrency_high_ratio
+        if lo > hi:
+            raise ValueError(
+                "threshold.safe_concurrency_low_ratio 不能大于 safe_concurrency_high_ratio"
+            )
         return self
 
 
@@ -229,6 +256,8 @@ def _resolve_paths(raw: Any, base: Path, prefix: tuple[str, ...] = ()) -> Any:
 
 def load_config(config_path: Path) -> EvalConfig:
     """从 YAML 加载配置，完成路径解析与 Pydantic 校验。
+
+    配置内的相对路径均相对于「该 YAML 文件所在目录」展开，与进程 cwd 无关。
 
     Raises:
         FileNotFoundError: 配置文件不存在。

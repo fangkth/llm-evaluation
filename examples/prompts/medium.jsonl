@@ -1,0 +1,2 @@
+{"id": "ex-med-1", "category": "medium", "messages": [{"role": "user", "content": "用约 80 字说明 REST 与 RPC 的主要区别。"}], "expected_output_tokens": 128}
+{"id": "ex-med-2", "category": "medium", "messages": [{"role": "user", "content": "列出 KV Cache 在自回归推理中的作用，分点说明。"}], "expected_output_tokens": 160}

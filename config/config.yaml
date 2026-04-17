@@ -1,5 +1,6 @@
 # LLM 容量测评 — 示例配置
-# 用法: uv run python runner.py config/config.yaml
+# 用法: uv run python runner.py --config config/config.yaml
+# 或: uv run llm-eval --config config/config.yaml
 # 相对路径均相对于「本 YAML 文件所在目录」解析
 
 server:
@@ -28,11 +29,20 @@ dataset:
 
 sampling:
   resource_interval_sec: 1.0
+  random_seed: 42
 
 threshold:
   max_error_rate: 0.05
+  min_success_rate: 0.99 # 最大稳定并发判定：成功率下限
   max_p95_ttft_sec: 30.0
   max_p95_latency_sec: 120.0
+  latency_regression_ratio: 1.2
+  gpu_high_util_avg: 75.0
+  gpu_high_util_peak: 88.0
+  gpu_high_mem_util_avg: 80.0
+  gpu_high_mem_util_peak: 92.0
+  safe_concurrency_low_ratio: 0.7
+  safe_concurrency_high_ratio: 0.8
 
 output:
   base_dir: "../output"

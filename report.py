@@ -1,148 +1,327 @@
-"""报告生成模块。
+"""测评 Markdown 报告：基于 ``summary.json`` 与原始 CSV 生成面向汇报的 ``report.md``。"""
 
-将分析结果序列化为 summary.json 和 Markdown 报告，
-所有输出写入本次运行的专属目录。
-"""
+from __future__ import annotations
 
+import csv
 import json
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from jinja2 import Template
 
-from analyzer import BottleneckReport, LevelStats
+from config_loader import EvalConfig
 
-MARKDOWN_TEMPLATE = """\
-# LLM 容量测评报告
+# 瓶颈类型 → 对外表述
+_BOTTLENECK_LABEL = {
+    "gpu_compute": "GPU 算力（推理计算）",
+    "gpu_memory": "显存 / KV Cache",
+    "tail_latency": "尾延迟（长请求或排队）",
+    "none": "未呈现单一明显资源瓶颈",
+    "unknown": "需结合日志进一步判断",
+    "cpu": "CPU 前处理或调度",
+    "service_overload": "服务过载或配置限制",
+}
 
-**生成时间：** {{ generated_at }}
-**服务地址：** {{ service_url }}
-**模型：** {{ model }}
+
+def bottleneck_label(code: str) -> str:
+    """瓶颈类型代码的简短中文说明（控制台、摘要等）。"""
+    return _BOTTLENECK_LABEL.get(str(code).strip(), str(code))
+
+
+def _load_summary(run_dir: Path) -> dict[str, Any]:
+    p = run_dir / "summary.json"
+    if not p.exists():
+        raise FileNotFoundError(f"未找到 summary.json: {p}")
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def _fmt_ts(iso: str) -> str:
+    try:
+        s = iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return iso
+
+
+def _load_raw_rows(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    with path.open(encoding="utf-8", newline="") as f:
+        for r in csv.DictReader(f):
+            rows.append(dict(r))
+    return rows
+
+
+def _parse_bool_cell(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes")
+
+
+def _parse_f(v: str, default: float = 0.0) -> float:
+    try:
+        return float(v) if v else default
+    except ValueError:
+        return default
+
+
+def _parse_i(v: str, default: int = 0) -> int:
+    try:
+        return int(float(v)) if v else default
+    except ValueError:
+        return default
+
+
+def _narrative_slowdown(stages: list[dict[str, Any]], ratio: float = 1.15) -> str:
+    ordered = sorted(stages, key=lambda x: x["concurrency"])
+    prev: dict[str, Any] | None = None
+    for s in ordered:
+        if prev is not None:
+            p0, p1 = prev["latency_sec"]["p95"], s["latency_sec"]["p95"]
+            if p0 > 0 and p1 >= p0 * ratio:
+                return (
+                    f"从并发 **{prev['concurrency']}** 提升到 **{s['concurrency']}** 时，"
+                    f"P95 端到端延迟由约 **{p0:.2f}s** 升至 **{p1:.2f}s**，"
+                    f"可视为响应开始明显变慢的区间。"
+                )
+        prev = s
+    return "各档之间 P95 延迟上升相对平缓，未观察到显著的「陡升」拐点。"
+
+
+def _narrative_near_limit(conclusions: dict[str, Any]) -> str:
+    near = int(conclusions.get("near_limit_concurrency") or 0)
+    stable = int(conclusions.get("max_stable_concurrency") or 0)
+    if near > stable > 0:
+        return (
+            f"结合成功率与延迟走势，**并发 {near}** 更接近当前环境的上限压力区；"
+            f"日常运行建议低于该档位。"
+        )
+    if stable > 0:
+        return (
+            f"在已测范围内，**并发 {stable}** 仍可满足稳定性判定；"
+            f"若继续加压，建议关注成功率与 P95 是否同步恶化。"
+        )
+    return "本次未识别出满足稳定性判定的档位，建议适度放宽阈值或检查服务与样本配置后复测。"
+
+
+def _narrative_long_requests(raw_rows: list[dict[str, str]], stages: list[dict[str, Any]]) -> str:
+    if not raw_rows or not stages:
+        return "原始请求明细不足，未做按样本长度的对比。"
+    max_c = max(s["concurrency"] for s in stages)
+    by_cat: dict[str, list[float]] = {}
+    for r in raw_rows:
+        if _parse_i(r.get("concurrency", "0")) != max_c:
+            continue
+        if not _parse_bool_cell(r.get("success", "false")):
+            continue
+        cat = (r.get("category") or "unknown").strip() or "unknown"
+        lat = _parse_f(r.get("latency_sec", "0"))
+        by_cat.setdefault(cat, []).append(lat)
+    if len(by_cat) < 2:
+        return "高并发档下可分类样本较少，暂不足以判断「长请求是否拖慢整体」。"
+
+    means = {k: sum(v) / len(v) for k, v in by_cat.items() if v}
+    long_m = means.get("long")
+    short_m = means.get("short")
+    if long_m and short_m and long_m > short_m * 1.25:
+        return (
+            f"在最高测试并发（{max_c}）下，**long** 类样本平均延迟（约 **{long_m:.2f}s**）"
+            f"明显高于 **short** 类（约 **{short_m:.2f}s**），"
+            f"存在长请求拉高尾延迟、影响体感的可能。"
+        )
+    return (
+        f"在最高测试并发（{max_c}）下，各长度样本的平均延迟差距不明显，"
+        f"整体表现未呈现典型的「长请求拖垮」形态。"
+    )
+
+
+def _build_table_rows(stages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for s in sorted(stages, key=lambda x: x["concurrency"]):
+        req = s["requests"]
+        tt = s["ttft_sec"]
+        lat = s["latency_sec"]
+        thr = s["throughput"]
+        rw = s.get("resources_in_stage_window", {})
+        gpu = rw.get("gpu", {})
+        gu = gpu.get("utilization_percent", {})
+        gmem = gpu.get("memory_utilization_percent", {})
+        sr = req["success_rate"] * 100
+        rows.append({
+            "conc": str(s["concurrency"]),
+            "sr": f"{sr:.1f}%",
+            "ttft_mean": f"{tt['mean']:.3f}",
+            "ttft_p95": f"{tt['p95']:.3f}",
+            "lat_mean": f"{lat['mean']:.3f}",
+            "lat_p95": f"{lat['p95']:.3f}",
+            "tok_s": f"{thr['completion_tokens_per_sec']:.1f}",
+            "gpu_u_avg": f"{gu.get('avg', 0):.1f}%",
+            "gpu_mem_avg": f"{gmem.get('avg', 0):.1f}%",
+        })
+    return rows
+
+
+def _closing_bullets(conclusions: dict[str, Any], cfg: EvalConfig) -> list[str]:
+    out: list[str] = []
+    ms = int(conclusions.get("max_stable_concurrency", 0))
+    sr = conclusions.get("safe_concurrency_range", {})
+    lo, hi = int(sr.get("min", 1)), int(sr.get("max", 1))
+    if ms > 0:
+        out.append(
+            f"在现有硬件与样本混合下，系统大致可稳定承载约 **{ms}** 路并发（满足成功率与 P95 阈值）。"
+        )
+    else:
+        out.append("本次未得到明确的「最大稳定并发」结论，建议先排查错误或放宽阈值后复测。")
+    if hi >= lo > 0:
+        out.append(f"面向日常生产，建议将并发控制在 **{lo}～{hi}** 区间内，并保留监控余量。")
+    for rec in conclusions.get("recommendations", []) or []:
+        if isinstance(rec, str) and rec.strip():
+            out.append(rec.strip())
+    out.append(
+        f"后续可固定样本与模型版本，定期复测；若业务上下文变长，应同步提高 **max_tokens** 与 **延迟阈值** 再评估。"
+    )
+    return out
+
+
+REPORT_TEMPLATE = """# LLM 服务容量测评报告
+
+> 本文档由测评工具根据实测数据自动生成，供内部汇报与客户沟通使用。
 
 ---
 
-## 一、各并发档位性能汇总
+## 1. 测试概述
 
-| 并发数 | 请求数 | 错误率 | P50延迟(s) | P95延迟(s) | TTFT P50(s) | TPS | RPS | GPU利用率峰值 |
-|--------|--------|--------|-----------|-----------|-------------|-----|-----|--------------|
-{% for s in stats_list -%}
-| {{ s.concurrency }} | {{ s.total_requests }} | {{ "%.1f%%"|format(s.error_rate * 100) }} | {{ "%.3f"|format(s.latency_p50) }} | {{ "%.3f"|format(s.latency_p95) }} | {{ "%.3f"|format(s.ttft_p50) }} | {{ "%.1f"|format(s.tps) }} | {{ "%.2f"|format(s.rps) }} | {{ "%.1f%%"|format(s.peak_gpu_util) }} |
+| 项目 | 内容 |
+|------|------|
+| 测试时间 | {{ overview.test_time }} |
+| 被测服务 | `{{ overview.service_url }}` |
+| 模型 | **{{ overview.model }}** |
+| 测试模式 | **{{ overview.mode }}**（{{ overview.mode_hint }}） |
+| 并发档位 | {{ overview.concurrency_list }} |
+| 单档正式时长 | {{ overview.duration_sec }} s（预热 {{ overview.ramp_up_sec }} s） |
+
+## 2. 测试样本说明
+
+{{ sample_section }}
+
+## 3. 关键结论摘要
+
+- **最大稳定并发（估算）**：**{{ key.max_stable }}** 路  
+- **建议安全运行区间**：**{{ key.safe_low }} ～ {{ key.safe_high }}** 路  
+- **当前主要瓶颈（程序判定）**：{{ key.bottleneck_human }}  
+- **要点说明**：{{ key.bottleneck_detail }}
+
+---
+
+## 4. 分档结果一览
+
+| 并发 | 成功率 | 平均 TTFT (s) | P95 TTFT (s) | 平均延迟 (s) | P95 延迟 (s) | 输出 tokens/s | GPU 平均利用率 | GPU 平均显存利用率 |
+|-----:|--------|--------------:|-------------:|-------------:|-------------:|----------------:|----------------:|-------------------:|
+{% for row in table_rows -%}
+| {{ row.conc }} | {{ row.sr }} | {{ row.ttft_mean }} | {{ row.ttft_p95 }} | {{ row.lat_mean }} | {{ row.lat_p95 }} | {{ row.tok_s }} | {{ row.gpu_u_avg }} | {{ row.gpu_mem_avg }} |
+{% endfor %}
+
+*说明：GPU 指标来自该档对应时间窗内的采样均值；若本机无 GPU 或监控未采集到数据，表中可能为 0%。*
+
+---
+
+## 5. 结果分析
+
+{{ analysis_block }}
+
+---
+
+## 6. 结论与建议
+
+{% for line in closing_lines -%}
+- {{ line }}
 {% endfor %}
 
 ---
 
-## 二、瓶颈分析
-
-**瓶颈类型：** `{{ bottleneck.bottleneck_type }}`
-
-**最大稳定并发：** {{ bottleneck.max_stable_concurrency }}
-
-**建议安全运行区间：** {{ bottleneck.safe_concurrency_min }} ~ {{ bottleneck.safe_concurrency_max }} 并发
-
-**结论：**
-
-{{ bottleneck.conclusion }}
-
----
-
-## 三、优化建议
-
-{% for rec in bottleneck.recommendations -%}
-- {{ rec }}
-{% endfor %}
-
----
-
-## 四、资源使用峰值汇总
-
-| 并发数 | GPU利用率 | 显存(GB) | CPU利用率 | 内存(GB) |
-|--------|----------|----------|----------|---------|
-{% for s in stats_list -%}
-| {{ s.concurrency }} | {{ "%.1f%%"|format(s.peak_gpu_util) }} | {{ "%.2f"|format(s.peak_gpu_mem_gb) }} | {{ "%.1f%%"|format(s.peak_cpu_percent) }} | {{ "%.2f"|format(s.peak_mem_used_gb) }} |
-{% endfor %}
-
----
-
-*由 llm-eval 自动生成*
+*报告生成工具：llm-eval · 数据目录：`{{ run_dir }}`*
 """
 
 
-class ReportWriter:
-    """测评报告写入器。
+def write_benchmark_report(
+    run_dir: Path,
+    cfg: EvalConfig,
+    *,
+    summary: dict[str, Any] | None = None,
+) -> Path:
+    """读取 ``summary.json``（及可选 ``raw_requests.csv``），写入 ``report.md``。"""
+    run_dir = Path(run_dir)
+    data = summary if summary is not None else _load_summary(run_dir)
+    stages = data.get("stages") or []
+    conclusions = data.get("conclusions") or {}
+    conf = data.get("config") or {}
+    server = conf.get("server") or {}
+    test = conf.get("test") or {}
 
-    将统计数据和瓶颈结论写入 output/{run_tag}/ 目录下的
-    summary.json 和 report.md 文件。
-    """
+    mode = str(test.get("mode") or "—")
+    mode_hints = {
+        "baseline": "低并发基线",
+        "step": "阶梯加压",
+        "stability": "固定并发长稳",
+    }
+    overview = {
+        "test_time": _fmt_ts(str(data.get("generated_at", ""))),
+        "service_url": server.get("base_url") or cfg.server.base_url,
+        "model": server.get("model") or cfg.server.model,
+        "mode": mode,
+        "mode_hint": mode_hints.get(mode, "自定义"),
+        "concurrency_list": "、".join(str(c) for c in (test.get("concurrency") or cfg.test.concurrency)),
+        "duration_sec": test.get("duration_sec", cfg.test.duration_sec),
+        "ramp_up_sec": test.get("ramp_up_sec", cfg.test.ramp_up_sec),
+    }
 
-    def __init__(
-        self,
-        run_dir: Path,
-        service_url: str,
-        model: str,
-    ):
-        self._run_dir = run_dir
-        self._service_url = service_url
-        self._model = model
-        self._run_dir.mkdir(parents=True, exist_ok=True)
+    ds = cfg.dataset
+    sample_section = (
+        f"本次压测按配置混合 **short / medium / long** 样本，目标占比约为 "
+        f"**{ds.short_ratio:.0%} / {ds.medium_ratio:.0%} / {ds.long_ratio:.0%}**。"
+        f"实际抽样为加权随机，明细见原始请求表。"
+    )
 
-    def write_summary(
-        self,
-        stats_list: list[LevelStats],
-        bottleneck: BottleneckReport,
-    ) -> Path:
-        """写入 summary.json，返回文件路径。"""
-        data = {
-            "generated_at": datetime.now().isoformat(),
-            "service_url": self._service_url,
-            "model": self._model,
-            "levels": [s.to_dict() for s in stats_list],
-            "bottleneck": bottleneck.to_dict(),
-        }
-        out_path = self._run_dir / "summary.json"
-        out_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        return out_path
+    bcode = str(conclusions.get("bottleneck", "unknown"))
+    ms = int(conclusions.get("max_stable_concurrency", 0))
+    srng = conclusions.get("safe_concurrency_range") or {}
+    key = {
+        "max_stable": str(ms) if ms > 0 else "本次未识别（请检查阈值或复测）",
+        "safe_low": srng.get("min", "—") if ms > 0 else "—",
+        "safe_high": srng.get("max", "—") if ms > 0 else "—",
+        "bottleneck_human": bottleneck_label(bcode),
+        "bottleneck_detail": str(conclusions.get("bottleneck_detail", "—")).strip() or "—",
+    }
 
-    def write_markdown(
-        self,
-        stats_list: list[LevelStats],
-        bottleneck: BottleneckReport,
-    ) -> Path:
-        """写入 report.md，返回文件路径。"""
-        tmpl = Template(MARKDOWN_TEMPLATE)
-        content = tmpl.render(
-            generated_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            service_url=self._service_url,
-            model=self._model,
-            stats_list=stats_list,
-            bottleneck=bottleneck,
-        )
-        out_path = self._run_dir / "report.md"
-        out_path.write_text(content, encoding="utf-8")
-        return out_path
+    raw_path = run_dir / "raw_requests.csv"
+    raw_rows = _load_raw_rows(raw_path)
 
-    def write_raw_requests(self, level_results: list) -> Path:
-        """将原始请求记录写入 raw_requests.jsonl。"""
-        out_path = self._run_dir / "raw_requests.jsonl"
-        lines = []
-        for lr in level_results:
-            for r in lr.results:
-                lines.append(json.dumps({
-                    "concurrency": lr.concurrency,
-                    "timestamp": r.timestamp,
-                    "success": r.success,
-                    "total_latency": r.total_latency,
-                    "ttft": r.ttft,
-                    "prompt_tokens": r.prompt_tokens,
-                    "completion_tokens": r.completion_tokens,
-                    "status_code": r.status_code,
-                    "error": r.error,
-                }, ensure_ascii=False))
-        out_path.write_text("\n".join(lines), encoding="utf-8")
-        return out_path
+    analysis_parts = [
+        "### 5.1 延迟走势",
+        _narrative_slowdown(stages),
+        "",
+        "### 5.2 与上限的距离",
+        _narrative_near_limit(conclusions),
+        "",
+        "### 5.3 长请求与尾延迟",
+        _narrative_long_requests(raw_rows, stages),
+    ]
+    analysis_block = "\n".join(analysis_parts)
 
-    def write_metrics(self, metric_samples: list) -> Path:
-        """将资源采样时序数据写入 metrics_samples.jsonl。"""
-        out_path = self._run_dir / "metrics_samples.jsonl"
-        lines = [json.dumps(s.to_dict(), ensure_ascii=False) for s in metric_samples]
-        out_path.write_text("\n".join(lines), encoding="utf-8")
-        return out_path
+    closing_lines = _closing_bullets(conclusions, cfg)
+
+    tmpl = Template(REPORT_TEMPLATE)
+    md = tmpl.render(
+        overview=overview,
+        sample_section=sample_section,
+        key=key,
+        table_rows=_build_table_rows(stages),
+        analysis_block=analysis_block,
+        closing_lines=closing_lines,
+        run_dir=str(run_dir.resolve()),
+    )
+
+    out = run_dir / "report.md"
+    out.write_text(md.strip() + "\n", encoding="utf-8")
+    return out

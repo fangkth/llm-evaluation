@@ -1,0 +1,2 @@
+{"id": "ex-long-1", "category": "long", "messages": [{"role": "user", "content": "请用中文写一段约 200 字的说明：大模型推理服务在做容量规划时，通常需要关注哪些指标（延迟、吞吐、显存、并发等），以及它们之间的权衡。"}], "expected_output_tokens": 320}
+{"id": "ex-long-2", "category": "long", "messages": [{"role": "user", "content": "从数据预处理、训练、推理部署三个阶段，各用两三句话概括 LLM 工程化中的常见瓶颈与缓解思路。"}], "expected_output_tokens": 400}

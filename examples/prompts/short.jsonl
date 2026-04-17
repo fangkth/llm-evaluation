@@ -1,0 +1,2 @@
+{"id": "ex-short-1", "category": "short", "messages": [{"role": "user", "content": "2+3=？只回答数字。"}], "expected_output_tokens": 8}
+{"id": "ex-short-2", "category": "short", "messages": [{"role": "user", "content": "HTTP 状态码 404 表示什么？一句话。"}], "expected_output_tokens": 24}

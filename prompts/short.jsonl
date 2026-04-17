@@ -1,5 +1,5 @@
-{"prompt": "1+1等于几？"}
-{"prompt": "用一句话介绍 Python。"}
-{"prompt": "什么是 HTTP？"}
-{"prompt": "列举三种排序算法。"}
-{"prompt": "CPU 和 GPU 的主要区别？"}
+{"id": "short-001", "category": "short", "messages": [{"role": "system", "content": "You are a concise assistant."}, {"role": "user", "content": "1+1 等于几？只回答数字。"}], "expected_output_tokens": 8}
+{"id": "short-002", "category": "short", "messages": [{"role": "user", "content": "用不超过 10 个字介绍 Python。"}], "expected_output_tokens": 32}
+{"id": "short-003", "category": "short", "messages": [{"role": "user", "content": "HTTP 默认端口是多少？"}], "expected_output_tokens": 16}
+{"id": "short-004", "category": "short", "messages": [{"role": "user", "content": "列举三种常见排序算法名称即可。"}], "expected_output_tokens": 24}
+{"id": "short-005", "category": "short", "messages": [{"role": "user", "content": "CPU 与 GPU 各适合哪类计算？各答一词。"}], "expected_output_tokens": 32}
