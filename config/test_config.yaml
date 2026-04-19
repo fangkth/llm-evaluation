@@ -11,13 +11,13 @@ server:
 
 test:
   mode: "step" # baseline | step | stability
-  concurrency: [1, 2, 4, 8]
+  concurrency: [1, 8, 16, 32]
   duration_sec: 20
   ramp_up_sec: 3
   # Ollama 当前更适合先用非流式拿到稳定的 usage / 吞吐统计
   stream: false
   timeout_sec: 60.0
-  max_tokens: 128
+  max_tokens: 256
 
 dataset:
   short_ratio: 0.5
