@@ -1,23 +1,23 @@
-# LLM 容量测评 — 示例配置
-# 用法: uv run python runner.py --config config/config.yaml
-# 或: uv run llm-eval --config config/config.yaml
+# LLM 容量测评 — 本机测试配置（Ollama / 开发验证）
+# 用途：先在个人电脑上验证链路、采样、报告与落盘流程是否正常。
 # 相对路径均相对于「本 YAML 文件所在目录」解析
 
 server:
-  base_url: "http://127.0.0.1:8000"
+  base_url: "http://host.docker.internal:11434"
   api_key: "EMPTY"
-  model: "your-vllm-model-name"
+  model: "qwen3.5:0.8b"
   # chat_completions: /v1/chat/completions ；completions: /v1/completions
   endpoint_type: "chat_completions"
 
 test:
   mode: "step" # baseline | step | stability
-  concurrency: [8, 16, 32, 48, 64]
-  duration_sec: 120
-  ramp_up_sec: 15
-  stream: true
-  timeout_sec: 180.0
-  max_tokens: 512
+  concurrency: [1, 2, 4, 8]
+  duration_sec: 20
+  ramp_up_sec: 3
+  # Ollama 当前更适合先用非流式拿到稳定的 usage / 吞吐统计
+  stream: false
+  timeout_sec: 60.0
+  max_tokens: 128
 
 dataset:
   short_ratio: 0.5
@@ -29,15 +29,15 @@ dataset:
 
 sampling:
   resource_interval_sec: 1.0
-  # GPU 索引；单机 8 卡场景建议显式写出
-  gpu_indices: [0, 1, 2, 3, 4, 5, 6, 7]
+  # GPU 索引；留空或省略表示自动监控本机全部 GPU
+  # gpu_indices: [0]
   random_seed: 42
 
 threshold:
   max_error_rate: 0.05
   min_success_rate: 0.99 # 最大稳定并发判定：成功率下限
-  max_p95_ttft_sec: 15.0
-  max_p95_latency_sec: 90.0
+  max_p95_ttft_sec: 30.0
+  max_p95_latency_sec: 120.0
   latency_regression_ratio: 1.2
   gpu_high_util_avg: 75.0
   gpu_high_util_peak: 88.0

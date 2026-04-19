@@ -224,7 +224,7 @@ class LLMClient:
         result.end_ts = time.time()
 
     def _parse_non_stream_body(self, data: dict[str, Any], result: RequestResult) -> None:
-        self._apply_usage(data.get("usage") or {})
+        result._apply_usage(data.get("usage") or {})
         choices = data.get("choices") or []
         if not choices:
             return
@@ -262,9 +262,8 @@ class LLMClient:
                     line = raw_line.strip()
                     if not line or line.startswith(":"):
                         continue
-                    if not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
+                    # 兼容 OpenAI SSE（data: ...）与部分兼容实现返回的 NDJSON 行。
+                    data_str = line[5:].strip() if line.startswith("data:") else line
                     if data_str == "[DONE]":
                         break
                     try:
@@ -274,7 +273,7 @@ class LLMClient:
 
                     usage = chunk.get("usage")
                     if usage:
-                        self._apply_usage(usage)
+                        result._apply_usage(usage)
 
                     self._accumulate_stream_chunk(chunk, pieces, result)
 
@@ -305,6 +304,9 @@ class LLMClient:
         if self._endpoint_type == EndpointType.CHAT_COMPLETIONS:
             delta = ch0.get("delta") or {}
             content = delta.get("content")
+            if content is None:
+                msg = ch0.get("message") or {}
+                content = msg.get("content")
             if isinstance(content, str) and content:
                 if not result.first_token_ts:
                     result.first_token_ts = time.time()

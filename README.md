@@ -106,7 +106,10 @@ python runner.py --help
 
 ## 配置文件说明
 
-默认示例：`config/config.yaml`。另提供可复制模板：`examples/config.example.yaml`（绑定 `examples/prompts/` 小样本，便于试跑）。
+默认示例：`config/config.yaml`（面向服务器 / vLLM 正式压测）。另提供：
+
+- `config/test_config.yaml`：本机开发验证 / Ollama 试跑配置
+- `examples/config.example.yaml`：最小示例模板（绑定 `examples/prompts/` 小样本，便于试跑）
 
 | 块 | 作用 |
 |----|------|
@@ -131,11 +134,23 @@ python runner.py --help
 uv run python runner.py --config examples/config.example.yaml --dry-run
 ```
 
+**本机开发验证（如 Ollama / 小模型 / 先跑通链路）**
+
+```bash
+uv run python runner.py --config config/test_config.yaml
+```
+
 **完整测评流程**（压测 → CSV → `summary.json` → `report.md`）
 
 ```bash
 uv run python runner.py --config config/config.yaml
 ```
+
+**服务器正式压测（如单机 8 卡 L40 + Docker vLLM）**
+
+- 建议将工具部署在与被测服务相同的服务器上运行
+- 使用 `config/config.yaml`，并按实际环境修改 `server.base_url` 与 `server.model`
+- 若服务器 GPU 数量或索引不同，请同步修改 `sampling.gpu_indices`
 
 常用参数：`--config` / `-c`、`--dry-run`、`--log-level`。
 
@@ -177,4 +192,6 @@ tests/            # 单元测试
 
 ## 许可证
 
-若对外交付，请根据组织要求补充 `LICENSE` 文件。
+本项目采用 [GNU General Public License v3.0 or later](./LICENSE)（`GPL-3.0-or-later`）开源。
+
+你可以自由使用、修改和分发本项目，但分发修改版本时需要继续遵守 GPL 的相应条款，并保留许可证与版权声明。
